@@ -123,5 +123,10 @@ Many thanks to these authors!
 ## 📝 Citation
 
 ```bibtex
-Coming soon.
+@article{lu2026ovggt,
+  title={OVGGT: O(1) Constant-Cost Streaming Visual Geometry Transformer},
+  author={Si-Yu Lu and Po-Ting Chen and Hui-Che Hsu and Sin-Ye Jhong and Wen-Huang Cheng and Yung-Yao Chen},
+  journal={arXiv preprint arXiv:2603.05959},
+  year={2026}
+}
 ```
