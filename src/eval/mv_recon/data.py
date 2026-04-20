@@ -9,7 +9,7 @@ from eval.mv_recon.base import BaseStereoViewDataset
 from dust3r.utils.image import imread_cv2
 import eval.mv_recon.dataset_utils.cropping as cropping
 import imageio.v3 as iio
-from tifffile import tifffile
+# from tifffile import tifffile
 from einops import rearrange
 
 
@@ -105,6 +105,16 @@ class SevenScenes(BaseStereoViewDataset):
         for scene in scenes:
             if self.test_id is not None and scene != self.test_id:
                 continue
+            scene_dir = osp.join(base_dir, scene)
+            if not osp.isdir(scene_dir):
+                continue
+
+            if self.seq_id is not None:
+                seq_path = osp.join(scene_dir, self.seq_id)
+                if osp.isdir(seq_path):
+                    self.scene_list.append(f"{scene}/{self.seq_id}")
+                continue
+
             # read file split
             with open(osp.join(base_dir, scene, file_split)) as f:
                 seq_ids = f.read().splitlines()

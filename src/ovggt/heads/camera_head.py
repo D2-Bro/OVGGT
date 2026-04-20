@@ -56,6 +56,8 @@ class CameraHead(nn.Module):
                 for _ in range(trunk_depth)
             ]
         )
+        for idx, block in enumerate(self.trunk):
+            block.attn.cache_debug_name = f"camera.trunk.{idx:02d}"
 
         # Normalizations for camera token and trunk output.
         self.token_norm = nn.LayerNorm(dim_in)
@@ -80,7 +82,15 @@ class CameraHead(nn.Module):
             drop=0,
         )
 
-    def forward(self, aggregated_tokens_list: list, num_iterations: int = 4, past_key_values_camera=None, use_cache: bool = False, anchor_token_count: int = None) -> list:
+    def forward(
+        self,
+        aggregated_tokens_list: list,
+        num_iterations: int = 4,
+        past_key_values_camera=None,
+        use_cache: bool = False,
+        anchor_token_count: int = None,
+        history_anchor_layout: str = "front",
+    ) -> list:
         """
         Forward pass to predict camera parameters.
 
@@ -104,14 +114,34 @@ class CameraHead(nn.Module):
 
         if use_cache:
             pred_pose_enc_list, past_key_values_camera = self.trunk_fn(
-                pose_tokens, num_iterations, past_key_values_camera, use_cache, anchor_token_count=anchor_token_count)
+                pose_tokens,
+                num_iterations,
+                past_key_values_camera,
+                use_cache,
+                anchor_token_count=anchor_token_count,
+                history_anchor_layout=history_anchor_layout,
+            )
             return pred_pose_enc_list, past_key_values_camera
         else:
             pred_pose_enc_list = self.trunk_fn(
-                pose_tokens, num_iterations, past_key_values_camera=None, use_cache=use_cache, anchor_token_count=anchor_token_count)
+                pose_tokens,
+                num_iterations,
+                past_key_values_camera=None,
+                use_cache=use_cache,
+                anchor_token_count=anchor_token_count,
+                history_anchor_layout=history_anchor_layout,
+            )
             return pred_pose_enc_list
 
-    def trunk_fn(self, pose_tokens: torch.Tensor, num_iterations: int, past_key_values_camera, use_cache: bool, anchor_token_count: int = None) -> list:
+    def trunk_fn(
+        self,
+        pose_tokens: torch.Tensor,
+        num_iterations: int,
+        past_key_values_camera,
+        use_cache: bool,
+        anchor_token_count: int = None,
+        history_anchor_layout: str = "front",
+    ) -> list:
         """
         Iteratively refine camera pose predictions.
 
@@ -187,6 +217,8 @@ class CameraHead(nn.Module):
                         cache_budget=layer_budget,
                         prev_importance=prev_importance,
                         anchor_token_count=anchor_token_count,
+                        anchor_base_token_count=num_iterations,
+                        history_anchor_layout=history_anchor_layout,
                     )
                     prev_importance = new_importance
                     temp_kv[idx] = block_kv
@@ -229,7 +261,14 @@ class CameraHead(nn.Module):
             return pred_pose_enc_list, past_key_values_camera
         return pred_pose_enc_list
 
-    def sync_anchor_change(self, past_key_values_camera, anchor_token_count, num_cam_iters=4, is_fifo=False):
+    def sync_anchor_change(
+        self,
+        past_key_values_camera,
+        anchor_token_count,
+        num_cam_iters=4,
+        is_fifo=False,
+        history_anchor_layout="front",
+    ):
         """
         Rearrange camera KV cache after an Aggregator anchor registration event.
 
@@ -255,7 +294,11 @@ class CameraHead(nn.Module):
         Returns:
             Modified past_key_values_camera
         """
+        if history_anchor_layout not in ("front", "tail"):
+            raise ValueError(f"Unknown history_anchor_layout: {history_anchor_layout}")
+
         global_anchor_end = num_cam_iters
+        history_tokens_after = max(int(anchor_token_count) - global_anchor_end, 0)
 
         for idx in range(self.trunk_depth):
             if past_key_values_camera[idx] is None:
@@ -263,42 +306,84 @@ class CameraHead(nn.Module):
             k, v = past_key_values_camera[idx]
             N = k.shape[2]
 
-            if N <= anchor_token_count:
+            if N <= global_anchor_end:
                 continue
 
-            new_frame_start = N - num_cam_iters
+            if history_anchor_layout == "front":
+                if N <= anchor_token_count:
+                    continue
 
-            if is_fifo:
-                demote_start = global_anchor_end
-                demote_end = global_anchor_end + num_cam_iters
+                new_frame_start = N - num_cam_iters
 
-                k_new = torch.cat([
-                    k[:, :, :demote_start, :],
-                    k[:, :, demote_end:anchor_token_count, :],
-                    k[:, :, new_frame_start:, :],
-                    k[:, :, anchor_token_count:new_frame_start, :],
-                    k[:, :, demote_start:demote_end, :],
-                ], dim=2)
-                v_new = torch.cat([
-                    v[:, :, :demote_start, :],
-                    v[:, :, demote_end:anchor_token_count, :],
-                    v[:, :, new_frame_start:, :],
-                    v[:, :, anchor_token_count:new_frame_start, :],
-                    v[:, :, demote_start:demote_end, :],
-                ], dim=2)
+                if is_fifo:
+                    demote_start = global_anchor_end
+                    demote_end = global_anchor_end + num_cam_iters
+
+                    k_new = torch.cat([
+                        k[:, :, :demote_start, :],
+                        k[:, :, demote_end:anchor_token_count, :],
+                        k[:, :, new_frame_start:, :],
+                        k[:, :, anchor_token_count:new_frame_start, :],
+                        k[:, :, demote_start:demote_end, :],
+                    ], dim=2)
+                    v_new = torch.cat([
+                        v[:, :, :demote_start, :],
+                        v[:, :, demote_end:anchor_token_count, :],
+                        v[:, :, new_frame_start:, :],
+                        v[:, :, anchor_token_count:new_frame_start, :],
+                        v[:, :, demote_start:demote_end, :],
+                    ], dim=2)
+                else:
+                    old_anchor_end = anchor_token_count - num_cam_iters
+
+                    k_new = torch.cat([
+                        k[:, :, :old_anchor_end, :],
+                        k[:, :, new_frame_start:, :],
+                        k[:, :, old_anchor_end:new_frame_start, :],
+                    ], dim=2)
+                    v_new = torch.cat([
+                        v[:, :, :old_anchor_end, :],
+                        v[:, :, new_frame_start:, :],
+                        v[:, :, old_anchor_end:new_frame_start, :],
+                    ], dim=2)
             else:
-                old_anchor_end = anchor_token_count - num_cam_iters
+                if history_tokens_after <= 0:
+                    continue
 
-                k_new = torch.cat([
-                    k[:, :, :old_anchor_end, :],
-                    k[:, :, new_frame_start:, :],
-                    k[:, :, old_anchor_end:new_frame_start, :],
-                ], dim=2)
-                v_new = torch.cat([
-                    v[:, :, :old_anchor_end, :],
-                    v[:, :, new_frame_start:, :],
-                    v[:, :, old_anchor_end:new_frame_start, :],
-                ], dim=2)
+                old_history_tokens = history_tokens_after if is_fifo else max(history_tokens_after - num_cam_iters, 0)
+                history_start = N - old_history_tokens
+                new_frame_end = history_start
+                new_frame_start = new_frame_end - num_cam_iters
+                if history_start < global_anchor_end or new_frame_start < global_anchor_end:
+                    continue
+
+                if is_fifo:
+                    demote_start = history_start
+                    demote_end = min(history_start + num_cam_iters, N)
+
+                    k_new = torch.cat([
+                        k[:, :, :new_frame_start, :],
+                        k[:, :, demote_start:demote_end, :],
+                        k[:, :, demote_end:N, :],
+                        k[:, :, new_frame_start:new_frame_end, :],
+                    ], dim=2)
+                    v_new = torch.cat([
+                        v[:, :, :new_frame_start, :],
+                        v[:, :, demote_start:demote_end, :],
+                        v[:, :, demote_end:N, :],
+                        v[:, :, new_frame_start:new_frame_end, :],
+                    ], dim=2)
+                else:
+                    k_new = torch.cat([
+                        k[:, :, :new_frame_start, :],
+                        k[:, :, new_frame_end:N, :],
+                        k[:, :, new_frame_start:new_frame_end, :],
+                    ], dim=2)
+                    v_new = torch.cat([
+                        v[:, :, :new_frame_start, :],
+                        v[:, :, new_frame_end:N, :],
+                        v[:, :, new_frame_start:new_frame_end, :],
+                    ], dim=2)
 
             past_key_values_camera[idx] = (k_new, v_new)
 

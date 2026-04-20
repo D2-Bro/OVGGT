@@ -1,4 +1,5 @@
 import time
+import os
 import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin  # used for model hub
@@ -139,11 +140,17 @@ class OVGGT(nn.Module, PyTorchModelHubMixin):
         max_anchors: int = 3,
         coverage_threshold: float = 0.2,
         anchor_keep_ratio: float = 0.05,
+        history_anchor_cache_layout: Optional[str] = None,
     ):
         past_key_values = [None] * self.aggregator.depth
         past_key_values_camera = [None] * self.camera_head.trunk_depth
         total_budget = self.total_budget
         importance_weight = self.importance_weight
+        if history_anchor_cache_layout is None:
+            history_anchor_cache_layout = os.environ.get("OVGGT_HISTORY_ANCHOR_LAYOUT", "front")
+        history_anchor_cache_layout = history_anchor_cache_layout.lower()
+        if history_anchor_cache_layout not in ("front", "tail"):
+            raise ValueError(f"Unknown history_anchor_cache_layout: {history_anchor_cache_layout}")
 
         # Calculate tokens per frame: camera(1) + register(4) + patches
         # For 518x392 with patch_size=14: 1 + 4 + (37 * 28) = 1041
@@ -173,6 +180,9 @@ class OVGGT(nn.Module, PyTorchModelHubMixin):
         processed_frames = []
 
         for i, frame in enumerate(frames):
+            anchor_token_count_before = anchor_manager.get_protected_token_count()
+            camera_anchor_token_count_before = anchor_manager.get_num_anchors() * 4
+
             # For fixed_interval: decision happens BEFORE inference
             fixed_interval_registered = False
             fixed_interval_is_fifo = False
@@ -187,6 +197,9 @@ class OVGGT(nn.Module, PyTorchModelHubMixin):
 
             # Get protected anchor token count (never pause eviction)
             anchor_token_count = anchor_manager.get_protected_token_count()
+            anchor_token_count_for_forward = anchor_token_count
+            if history_anchor_cache_layout == "tail" and fixed_interval_registered:
+                anchor_token_count_for_forward = anchor_token_count_before
 
             images = frame["img"].unsqueeze(0)
 
@@ -197,7 +210,8 @@ class OVGGT(nn.Module, PyTorchModelHubMixin):
                 use_cache=True,
                 past_frame_idx=i,
                 total_budget=total_budget,  
-                anchor_token_count=anchor_token_count,
+                anchor_token_count=anchor_token_count_for_forward,
+                history_anchor_layout=history_anchor_cache_layout,
                 importance_weight=importance_weight,
             )
 
@@ -212,23 +226,36 @@ class OVGGT(nn.Module, PyTorchModelHubMixin):
                     num_cam_iters = 4  # camera head refinement iterations per frame
                     total_anchors = anchor_manager.get_num_anchors()  # 1 (global) + history
                     camera_anchor_token_count = total_anchors * num_cam_iters
+                    camera_anchor_token_count_for_forward = camera_anchor_token_count
+                    if history_anchor_cache_layout == "tail" and fixed_interval_registered:
+                        camera_anchor_token_count_for_forward = camera_anchor_token_count_before
 
                     pose_enc, past_key_values_camera = self.camera_head(
                         aggregated_tokens,
                         past_key_values_camera=past_key_values_camera,
                         use_cache=True,
-                        anchor_token_count=camera_anchor_token_count,
+                        anchor_token_count=camera_anchor_token_count_for_forward,
+                        history_anchor_layout=history_anchor_cache_layout,
                     )
                     pose_enc = pose_enc[-1]
                     camera_pose = pose_enc[:, 0, :]
 
                     # For fixed_interval: sync camera KV cache AFTER processing
                     if fixed_interval_registered:
+                        if history_anchor_cache_layout == "tail":
+                            past_key_values = self.aggregator.sync_anchor_change(
+                                past_key_values,
+                                anchor_token_count=anchor_token_count,
+                                anchor_tokens_per_history=int(tokens_per_frame * anchor_keep_ratio),
+                                history_anchor_layout=history_anchor_cache_layout,
+                                is_fifo=fixed_interval_is_fifo,
+                            )
                         past_key_values_camera = self.camera_head.sync_anchor_change(
                             past_key_values_camera,
                             anchor_token_count=camera_anchor_token_count,
                             num_cam_iters=4,
                             is_fifo=fixed_interval_is_fifo,
+                            history_anchor_layout=history_anchor_cache_layout,
                         )
 
                 if self.depth_head is not None:
@@ -266,6 +293,15 @@ class OVGGT(nn.Module, PyTorchModelHubMixin):
                     fifo_msg = " (FIFO: oldest demoted)" if is_fifo else ""
                     print(f"[History Anchor] Frame {i} registered{fifo_msg}: {reason}")
 
+                    if history_anchor_cache_layout == "tail":
+                        past_key_values = self.aggregator.sync_anchor_change(
+                            past_key_values,
+                            anchor_token_count=anchor_manager.get_protected_token_count(),
+                            anchor_tokens_per_history=int(tokens_per_frame * anchor_keep_ratio),
+                            history_anchor_layout=history_anchor_cache_layout,
+                            is_fifo=is_fifo,
+                        )
+
                     # Sync camera KV cache anchor zone with Aggregator's FIFO/promotion.
                     cam_anchor_count_post = anchor_manager.get_num_anchors() * 4
                     past_key_values_camera = self.camera_head.sync_anchor_change(
@@ -273,6 +309,7 @@ class OVGGT(nn.Module, PyTorchModelHubMixin):
                         anchor_token_count=cam_anchor_count_post,
                         num_cam_iters=4,
                         is_fifo=is_fifo,
+                        history_anchor_layout=history_anchor_cache_layout,
                     )
 
             res_gpu = {

@@ -22,13 +22,17 @@ from ovggt.utils.load_fn import load_and_preprocess_images
 from ovggt.utils.pose_enc import pose_encoding_to_extri_intri
 from viser_utils import PointCloudViewer
 
-def get_image_paths(seq_path, interval=1):
+def get_image_paths(seq_path, interval=1, max_frames=None):
     """Returns list of image paths. Extracts frames if video."""
     tmp_dir = None
     if os.path.isdir(seq_path):
         exts = {'.jpg', '.jpeg', '.png', '.bmp', '.tif', '.webp'}
         paths = [p for p in natsorted(glob.glob(os.path.join(seq_path, "*.color.png"))) 
                  if os.path.splitext(p)[1].lower() in exts]
+
+        if max_frames is not None:
+            paths = paths[:max_frames]
+
         return paths[::interval], None
     
     # Video handling
@@ -165,11 +169,12 @@ def main():
     parser.add_argument("--frame_interval", type=int, default=1)
     parser.add_argument("--port", type=int, default=9999)
     parser.add_argument("--ckpt", default="./ckpt/checkpoints.pth", help="Path to StreamVGGT checkpoint")
+    parser.add_argument("--max_frames", type=int, default=None, help="Max frames to process (for GT alignment)")
     args = parser.parse_args()
 
     # Load Data
     print(f"Loading from {args.seq_path}...")
-    img_paths, tmp_dir = get_image_paths(args.seq_path, args.frame_interval)
+    img_paths, tmp_dir = get_image_paths(args.seq_path, args.frame_interval, args.max_frames)
     
     # Load Model
     ckpt_path = args.ckpt
@@ -189,32 +194,21 @@ def main():
     del ckpt
     model.eval()
 
-    # Inference & Save
-    preds = run_inference(model, img_paths, args.device, args.size)
-    vis_data = save_and_format(preds, args.output_dir)
 
-    # Alignment (if GT exists)
-    gt_poses = load_gt_poses(args.gt_path, args.frame_interval, len(vis_data['t']))
-    if gt_poses is not None:
-        gt_poses = align_sim3(gt_poses, vis_data['t'])
+    # iter 100 times to check stability depending on the KV cache order
+    for i in range(100):    
+        # Inference & Save
+        preds = run_inference(model, img_paths, args.device, args.size)
+    
+        result_dir = os.path.join(args.output_dir, f"results_{i}")
+        save_data = save_and_format(preds, result_dir)
 
-    # Visualization
-    print(f"Launching Viser on port {args.port}...")
-    viewer = PointCloudViewer(
-        model, None, 
-        vis_data['pts'], vis_data['colors'], vis_data['confs'],
-        {"R": vis_data['R'], "t": vis_data['t'], "focal": vis_data['focal'], "pp": vis_data['pp']},
-        gt_poses=gt_poses,
-        device=args.device,
-        vis_threshold=args.vis_threshold,
-        size=args.size,
-        port=args.port,
-        edge_color_list=[None]*len(img_paths),
-        show_camera=True
-    )
-    viewer.run()
+        # Alignment (if GT exists)
+        gt_poses = load_gt_poses(args.gt_path, args.frame_interval, len(save_data['t']))
+        if gt_poses is not None:
+            gt_poses = align_sim3(gt_poses, save_data['t'])
 
-    if tmp_dir: shutil.rmtree(tmp_dir)
+        if tmp_dir: shutil.rmtree(tmp_dir)
 
 if __name__ == "__main__":
     main()

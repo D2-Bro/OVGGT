@@ -17,6 +17,7 @@ from tqdm import tqdm
 import uuid
 import json
 from collections import defaultdict
+import random
 
 def get_args_parser():
     parser = argparse.ArgumentParser("3D Reconstruction evaluation", add_help=False)
@@ -40,9 +41,27 @@ def get_args_parser():
     parser.add_argument("--size", type=int, default=518)
     parser.add_argument("--revisit", type=int, default=1, help="revisit times")
     parser.add_argument("--freeze", action="store_true")
-    parser.add_argument("--max_frames", type=int, default=None, help="max frames limit")
+    parser.add_argument("--max_frames", type=int, default=500, help="max frames limit")
     parser.add_argument("--use_proj", action="store_true")
+    parser.add_argument("--seven_scenes_root", type=str, default="/data2/dongjae/datasets/7scenes_sfm")
+    parser.add_argument("--seven_scenes_seq_id", type=str, default="seq-01")
+    # parser.add_argument("--seven_scenes_scene", type=str, default=None)
+    parser.add_argument(
+        "--skip_save_artifacts",
+        action="store_true",
+        help="skip saving intermediate .npy and .ply artifacts; metrics/logs are still written",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="random seed for reproducibility")
+    parser.add_argument("--voxel_size", type=float, default=0, help="voxel size for downsampling before ICP (0 to disable)")
     return parser
+
+
+def record_stage(stage_times, name, start, sync_cuda=False):
+    if sync_cuda and torch.cuda.is_available():
+        torch.cuda.synchronize()
+    end = time.perf_counter()
+    stage_times[name] = end - start
+    return end
 
 
 def main(args):
@@ -62,12 +81,14 @@ def main(args):
     datasets_all = {
         "7scenes": SevenScenes(
             split="test",
-            ROOT="./data/7scenes",
+            ROOT=args.seven_scenes_root,
             resolution=resolution,
             num_seq=1,
             full_video=True,
             kf_every=2,
-            # max_frames=args.max_frames,
+            max_frames=args.max_frames,
+            seq_id=args.seven_scenes_seq_id,
+            # test_id=args.seven_scenes_scene,
         ),  # 20),
         # "NRGBD": NRGBD(
         #     split="test",
@@ -80,6 +101,11 @@ def main(args):
     }
 
     accelerator = Accelerator()
+    seed = args.seed + accelerator.process_index
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
     device = accelerator.device
     model_name = args.model_name
     if model_name == "OVGGT":
@@ -134,6 +160,9 @@ def main(args):
 
             with accelerator.split_between_processes(list(range(len(dataset)))) as idxs:
                 for data_idx in tqdm(idxs):
+                    stage_times = {}
+                    scene_total_start = time.perf_counter()
+                    stage_start = scene_total_start
                     batch = default_collate([dataset[data_idx]])
                     ignore_keys = set(
                         [
@@ -158,6 +187,9 @@ def main(args):
                                 ]
                             else:
                                 view[name] = view[name].to(device, non_blocking=True)
+                    stage_start = record_stage(
+                        stage_times, "load_to_device", stage_start, sync_cuda=True
+                    )
 
                     pts_all = []
                     pts_gt_all = []
@@ -166,7 +198,7 @@ def main(args):
                     conf_all = []
                     in_camera1 = None  
 
-                    if model_name == "stream3r" or "VGGT":
+                    if model_name in ("stream3r", "VGGT", "OVGGT"):
                         revisit = args.revisit
                         update = not args.freeze
                         if revisit > 1:
@@ -200,7 +232,7 @@ def main(args):
 
                         with torch.cuda.amp.autocast(dtype=dtype):
                             with torch.no_grad():
-                                results = model.inference(batch)
+                                results = model.inference(batch, history_anchor_cache_layout="tail")
 
                             preds, batch = results.ress, results.views 
 
@@ -224,10 +256,16 @@ def main(args):
                                 batch = batch[-valid_length:]
                                 
 
+                        stage_start = record_stage(
+                            stage_times, "inference", stage_start, sync_cuda=True
+                        )
                         # Evaluation
                         print(f"Evaluation for {name_data} {data_idx+1}/{len(dataset)}")
                         gt_pts, pred_pts, gt_factor, pr_factor, masks, monitoring = (
                             criterion.get_all_pts3d_t(batch, preds)
+                        )
+                        stage_start = record_stage(
+                            stage_times, "criterion", stage_start, sync_cuda=True
                         )
 
                         in_camera1 = None
@@ -279,20 +317,23 @@ def main(args):
                     pts_all = np.concatenate(pts_all, axis=0)
                     pts_gt_all = np.concatenate(pts_gt_all, axis=0)
                     masks_all = np.concatenate(masks_all, axis=0)
+                    stage_start = record_stage(stage_times, "collect_numpy", stage_start)
 
                     scene_id = view["label"][0].rsplit("/", 1)[0]
 
-                    save_params = {}
+                    if not args.skip_save_artifacts:
+                        save_params = {}
 
-                    save_params["images_all"] = images_all
-                    save_params["pts_all"] = pts_all
-                    save_params["pts_gt_all"] = pts_gt_all
-                    save_params["masks_all"] = masks_all
+                        save_params["images_all"] = images_all
+                        save_params["pts_all"] = pts_all
+                        save_params["pts_gt_all"] = pts_gt_all
+                        save_params["masks_all"] = masks_all
 
-                    np.save(
-                        os.path.join(save_path, f"{scene_id.replace('/', '_')}.npy"),
-                        save_params,
-                    )
+                        np.save(
+                            os.path.join(save_path, f"{scene_id.replace('/', '_')}.npy"),
+                            save_params,
+                        )
+                    stage_start = record_stage(stage_times, "save_artifacts", stage_start)
 
                     if "DTU" in name_data:
                         threshold = 100
@@ -344,6 +385,7 @@ def main(args):
                         s, R, t = umeyama_alignment(pts_all_masked, pts_gt_all_masked, with_scale=True)
                         pts_all_aligned = (s * (R @ pts_all_masked.T)).T + t  # (N,3)
                         pts_all_masked = pts_all_aligned
+                    stage_start = record_stage(stage_times, "mask_filter", stage_start)
 
                     pcd = o3d.geometry.PointCloud()
                     pcd.points = o3d.utility.Vector3dVector(
@@ -352,13 +394,13 @@ def main(args):
                     pcd.colors = o3d.utility.Vector3dVector(
                         images_all_masked.reshape(-1, 3)
                     )
-                    o3d.io.write_point_cloud(
-                        os.path.join(
-                            save_path, f"{scene_id.replace('/', '_')}-mask.ply"
-                        ),
-                        pcd,
-                    )
-
+                    if not args.skip_save_artifacts:
+                        o3d.io.write_point_cloud(
+                            os.path.join(
+                                save_path, f"{scene_id.replace('/', '_')}-mask.ply"
+                            ),
+                            pcd,
+                        )
                     pcd_gt = o3d.geometry.PointCloud()
                     pcd_gt.points = o3d.utility.Vector3dVector(
                         pts_gt_all_masked.reshape(-1, 3)
@@ -366,105 +408,145 @@ def main(args):
                     pcd_gt.colors = o3d.utility.Vector3dVector(
                         images_all_masked.reshape(-1, 3)
                     )
-                    o3d.io.write_point_cloud(
-                        os.path.join(save_path, f"{scene_id.replace('/', '_')}-gt.ply"),
-                        pcd_gt,
-                    )
+                    if not args.skip_save_artifacts:
+                        o3d.io.write_point_cloud(
+                            os.path.join(save_path, f"{scene_id.replace('/', '_')}-gt.ply"),
+                            pcd_gt,
+                        )
+                    stage_start = record_stage(stage_times, "pcd_build", stage_start)
 
+                    if args.voxel_size > 0:
+                        pcd = pcd.voxel_down_sample(args.voxel_size)
+                        pcd_gt = pcd_gt.voxel_down_sample(args.voxel_size)
+                    stage_start = record_stage(stage_times, "voxel", stage_start)
+                    
+                    icp_voxel = 0.01
+                    pcd_icp = pcd.voxel_down_sample(icp_voxel)
+                    pcd_gt_icp = pcd_gt.voxel_down_sample(icp_voxel)
                     trans_init = np.eye(4)
 
                     reg_p2p = o3d.pipelines.registration.registration_icp(
-                        pcd,
-                        pcd_gt,
+                        pcd_icp,
+                        pcd_gt_icp,
                         threshold,
                         trans_init,
                         o3d.pipelines.registration.TransformationEstimationPointToPoint(),
                     )
 
                     transformation = reg_p2p.transformation
+                    stage_start = record_stage(stage_times, "icp", stage_start)
 
                     pcd = pcd.transform(transformation)
 
-                    o3d.io.write_point_cloud(
-                        os.path.join(
-                            save_path, f"{scene_id.replace('/', '_')}-mask_align.ply"
-                        ),
-                        pcd,
+                    if not args.skip_save_artifacts:
+                        o3d.io.write_point_cloud(
+                            os.path.join(
+                                save_path, f"{scene_id.replace('/', '_')}-mask_align.ply"
+                            ),
+                            pcd,
+                        )
+                    stage_start = record_stage(stage_times, "transform_save", stage_start)
+
+                    # pcd.estimate_normals()
+                    # pcd_gt.estimate_normals()
+
+                    # gt_normal = np.asarray(pcd_gt.normals)
+                    # pred_normal = np.asarray(pcd.normals)
+
+                    # acc, acc_med, nc1, nc1_med = accuracy(
+                    #     pcd_gt.points, pcd.points, gt_normal, pred_normal
+                    # )
+                    # comp, comp_med, nc2, nc2_med = completion(
+                    #     pcd_gt.points, pcd.points, gt_normal, pred_normal
+                    # )
+                    # print(
+                    #     f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}"
+                    # )
+                    # print(
+                    #     f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}",
+                    #     file=open(log_file, "a"),
+                    # )
+
+                    acc, acc_med = accuracy(
+                        pcd_gt.points, pcd.points
                     )
-
-                    pcd.estimate_normals()
-                    pcd_gt.estimate_normals()
-
-                    gt_normal = np.asarray(pcd_gt.normals)
-                    pred_normal = np.asarray(pcd.normals)
-
-                    acc, acc_med, nc1, nc1_med = accuracy(
-                        pcd_gt.points, pcd.points, gt_normal, pred_normal
+                    comp, comp_med = completion(
+                        pcd_gt.points, pcd.points
                     )
-                    comp, comp_med, nc2, nc2_med = completion(
-                        pcd_gt.points, pcd.points, gt_normal, pred_normal
+                    stage_start = record_stage(
+                        stage_times, "metric", stage_start, sync_cuda=True
+                    )
+                    stage_times["total"] = time.perf_counter() - scene_total_start
+                    timing_str = " | ".join(
+                        f"{name}: {elapsed:.3f}s"
+                        for name, elapsed in stage_times.items()
                     )
                     print(
-                        f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}"
+                        f"Idx: {scene_id}, Acc: {acc}, Comp: {comp} - Acc_med: {acc_med}, Compc_med: {comp_med}"
                     )
+                    print(f"TIMING: {scene_id} | {timing_str}")
                     print(
-                        f"Idx: {scene_id}, Acc: {acc}, Comp: {comp}, NC1: {nc1}, NC2: {nc2} - Acc_med: {acc_med}, Compc_med: {comp_med}, NC1c_med: {nc1_med}, NC2c_med: {nc2_med}",
+                        f"Idx: {scene_id}, Acc: {acc}, Comp: {comp} - Acc_med: {acc_med}, Compc_med: {comp_med}",
                         file=open(log_file, "a"),
+                    )
+                    print(
+                        f"TIMING: {scene_id} | {timing_str}",
+                        # file=open(log_file, "a"),
                     )
 
                     acc_all += acc
                     comp_all += comp
-                    nc1_all += nc1
-                    nc2_all += nc2
+                    # nc1_all += nc1
+                    # nc2_all += nc2
 
                     acc_all_med += acc_med
                     comp_all_med += comp_med
-                    nc1_all_med += nc1_med
-                    nc2_all_med += nc2_med
+                    # nc1_all_med += nc1_med
+                    # nc2_all_med += nc2_med
 
                     # release cuda memory
                     torch.cuda.empty_cache()
 
-            accelerator.wait_for_everyone()
+            # accelerator.wait_for_everyone()
             # Get depth from pcd and run TSDFusion
-            if accelerator.is_main_process:
-                to_write = ""
-                # Copy the error log from each process to the main error log
-                for i in range(8):
-                    if not os.path.exists(osp.join(save_path, f"logs_{i}.txt")):
-                        break
-                    with open(osp.join(save_path, f"logs_{i}.txt"), "r") as f_sub:
-                        to_write += f_sub.read()
+            # if accelerator.is_main_process:
+            #     to_write = ""
+            #     # Copy the error log from each process to the main error log
+            #     for i in range(8):
+            #         if not os.path.exists(osp.join(save_path, f"logs_{i}.txt")):
+            #             break
+            #         with open(osp.join(save_path, f"logs_{i}.txt"), "r") as f_sub:
+            #             to_write += f_sub.read()
 
-                with open(osp.join(save_path, f"logs_all.txt"), "w") as f:
-                    log_data = to_write
-                    metrics = defaultdict(list)
-                    for line in log_data.strip().split("\n"):
-                        match = regex.match(line)
-                        if match:
-                            data = match.groupdict()
-                            # Exclude 'scene_id' from metrics as it's an identifier
-                            for key, value in data.items():
-                                if key != "scene_id":
-                                    metrics[key].append(float(value))
-                            metrics["nc"].append(
-                                (float(data["nc1"]) + float(data["nc2"])) / 2
-                            )
-                            metrics["nc_med"].append(
-                                (float(data["nc1_med"]) + float(data["nc2_med"])) / 2
-                            )
-                    mean_metrics = {
-                        metric: sum(values) / len(values)
-                        for metric, values in metrics.items()
-                    }
+            #     with open(osp.join(save_path, f"logs_all.txt"), "w") as f:
+            #         log_data = to_write
+            #         metrics = defaultdict(list)
+            #         for line in log_data.strip().split("\n"):
+            #             match = regex.match(line)
+            #             if match:
+            #                 data = match.groupdict()
+            #                 # Exclude 'scene_id' from metrics as it's an identifier
+            #                 for key, value in data.items():
+            #                     if key != "scene_id":
+            #                         metrics[key].append(float(value))
+            #                 # metrics["nc"].append(
+            #                 #     (float(data["nc1"]) + float(data["nc2"])) / 2
+            #                 # )
+            #                 # metrics["nc_med"].append(
+            #                 #     (float(data["nc1_med"]) + float(data["nc2_med"])) / 2
+            #                 # )
+            #         mean_metrics = {
+            #             metric: sum(values) / len(values)
+            #             for metric, values in metrics.items()
+            #         }
 
-                    c_name = "mean"
-                    print_str = f"{c_name.ljust(20)}: "
-                    for m_name in mean_metrics:
-                        print_num = np.mean(mean_metrics[m_name])
-                        print_str = print_str + f"{m_name}: {print_num:.3f} | "
-                    print_str = print_str + "\n"
-                    f.write(to_write + print_str)
+            #         c_name = "mean"
+            #         print_str = f"{c_name.ljust(20)}: "
+            #         for m_name in mean_metrics:
+            #             print_num = np.mean(mean_metrics[m_name])
+            #             print_str = print_str + f"{m_name}: {print_num:.3f} | "
+            #         print_str = print_str + "\n"
+            #         f.write(to_write + print_str)
 
 
 
@@ -475,12 +557,12 @@ pattern = r"""
     Idx:\s*(?P<scene_id>[^,]+),\s*
     Acc:\s*(?P<acc>[^,]+),\s*
     Comp:\s*(?P<comp>[^,]+),\s*
-    NC1:\s*(?P<nc1>[^,]+),\s*
-    NC2:\s*(?P<nc2>[^,]+)\s*-\s*
+    # NC1:\s*(?P<nc1>[^,]+),\s*
+    # NC2:\s*(?P<nc2>[^,]+)\s*-\s*
     Acc_med:\s*(?P<acc_med>[^,]+),\s*
     Compc_med:\s*(?P<comp_med>[^,]+),\s*
-    NC1c_med:\s*(?P<nc1_med>[^,]+),\s*
-    NC2c_med:\s*(?P<nc2_med>[^,]+)
+    # NC1c_med:\s*(?P<nc1_med>[^,]+),\s*
+    # NC2c_med:\s*(?P<nc2_med>[^,]+)
 """
 
 regex = re.compile(pattern, re.VERBOSE)

@@ -3,3 +3,6 @@ ckpt/
 __pycache__/
 *.pyc
 .gradio/
+cache_tsne/
+eval_results/
+outputs/

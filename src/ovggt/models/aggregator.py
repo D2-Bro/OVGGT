@@ -126,6 +126,8 @@ class Aggregator(nn.Module):
                 for _ in range(depth)
             ]
         )
+        for idx, block in enumerate(self.global_blocks):
+            block.attn.cache_debug_name = f"aggregator.global.{idx:02d}"
 
         self.depth = depth
         self.aa_order = aa_order
@@ -212,6 +214,7 @@ class Aggregator(nn.Module):
         past_frame_idx=0,
         total_budget=0,
         anchor_token_count: int = None,
+        history_anchor_layout: str = "front",
         importance_weight: float = 0.5,
     ) -> Tuple[List[torch.Tensor], int]:
         """
@@ -318,6 +321,8 @@ class Aggregator(nn.Module):
                             prev_importance=prev_importance,
                             intra_frame_keep_ratio=self.intra_frame_keep_ratio,
                             anchor_token_count=anchor_token_count,
+                            anchor_base_token_count=P,
+                            history_anchor_layout=history_anchor_layout,
                             importance_weight=importance_weight,
                         )
 
@@ -388,6 +393,8 @@ class Aggregator(nn.Module):
         prev_importance=None,
         intra_frame_keep_ratio=1.0,
         anchor_token_count: int = None,
+        anchor_base_token_count: int = None,
+        history_anchor_layout: str = "front",
         importance_weight: float = 0.5,
     ) -> Union[Tuple[torch.Tensor, int, List[torch.Tensor]], Tuple[torch.Tensor, int, List[torch.Tensor], List]]:
         """
@@ -435,7 +442,10 @@ class Aggregator(nn.Module):
                     prev_importance=prev_importance,
                     intra_frame_keep_ratio=effective_keep_ratio,
                     anchor_token_count=anchor_token_count,
+                    anchor_base_token_count=anchor_base_token_count,
+                    history_anchor_layout=history_anchor_layout,
                     importance_weight=importance_weight,
+                    cache_debug_current_frame_idx=past_frame_idx,
                 )
             else:
                 tokens = self.global_blocks[global_idx](tokens, pos=pos, attn_mask=attn_mask)
@@ -448,6 +458,124 @@ class Aggregator(nn.Module):
         if use_cache:
             return tokens, global_idx, intermediates, block_kv, scores, new_importance, kept_indices
         return tokens, global_idx, intermediates
+
+    def sync_anchor_change(
+        self,
+        past_key_values,
+        anchor_token_count,
+        anchor_tokens_per_history,
+        history_anchor_layout="front",
+        is_fifo=False,
+    ):
+        """
+        Rearrange Aggregator KV cache after a frame becomes a history anchor.
+
+        front layout keeps the legacy protected zone at the beginning:
+            [global + history anchors][candidates]
+
+        tail layout keeps only the global anchor in front and stores history
+        anchors at the end:
+            [global][candidates][history anchors]
+        """
+        if history_anchor_layout not in ("front", "tail"):
+            raise ValueError(f"Unknown history_anchor_layout: {history_anchor_layout}")
+
+        global_anchor_end = self.patch_start_idx + self.patch_grid_size[0] * self.patch_grid_size[1]
+        history_tokens_after = max(int(anchor_token_count) - global_anchor_end, 0)
+        anchor_tokens_per_history = int(anchor_tokens_per_history)
+        if anchor_tokens_per_history <= 0 or history_tokens_after <= 0:
+            return past_key_values
+
+        for idx in range(self.depth):
+            if past_key_values[idx] is None:
+                continue
+
+            k, v = past_key_values[idx]
+            N = k.shape[2]
+            if N <= global_anchor_end:
+                continue
+
+            if history_anchor_layout == "front":
+                if N <= anchor_token_count:
+                    continue
+
+                new_frame_start = max(N - anchor_tokens_per_history, anchor_token_count)
+                if is_fifo:
+                    demote_start = global_anchor_end
+                    demote_end = min(global_anchor_end + anchor_tokens_per_history, anchor_token_count)
+                    if demote_end <= demote_start or new_frame_start >= N:
+                        continue
+
+                    k_new = torch.cat([
+                        k[:, :, :demote_start, :],
+                        k[:, :, demote_end:anchor_token_count, :],
+                        k[:, :, new_frame_start:, :],
+                        k[:, :, anchor_token_count:new_frame_start, :],
+                        k[:, :, demote_start:demote_end, :],
+                    ], dim=2)
+                    v_new = torch.cat([
+                        v[:, :, :demote_start, :],
+                        v[:, :, demote_end:anchor_token_count, :],
+                        v[:, :, new_frame_start:, :],
+                        v[:, :, anchor_token_count:new_frame_start, :],
+                        v[:, :, demote_start:demote_end, :],
+                    ], dim=2)
+                else:
+                    old_anchor_end = max(anchor_token_count - anchor_tokens_per_history, global_anchor_end)
+                    new_frame_start = max(N - anchor_tokens_per_history, old_anchor_end)
+                    if new_frame_start >= N:
+                        continue
+
+                    k_new = torch.cat([
+                        k[:, :, :old_anchor_end, :],
+                        k[:, :, new_frame_start:, :],
+                        k[:, :, old_anchor_end:new_frame_start, :],
+                    ], dim=2)
+                    v_new = torch.cat([
+                        v[:, :, :old_anchor_end, :],
+                        v[:, :, new_frame_start:, :],
+                        v[:, :, old_anchor_end:new_frame_start, :],
+                    ], dim=2)
+            else:
+                old_history_tokens = history_tokens_after if is_fifo else max(history_tokens_after - anchor_tokens_per_history, 0)
+                history_start = N - old_history_tokens
+                new_frame_end = history_start
+                new_frame_start = new_frame_end - anchor_tokens_per_history
+                if history_start < global_anchor_end or new_frame_start < global_anchor_end:
+                    continue
+
+                if is_fifo:
+                    demote_start = history_start
+                    demote_end = min(history_start + anchor_tokens_per_history, N)
+                    remaining_history_start = demote_end
+
+                    k_new = torch.cat([
+                        k[:, :, :new_frame_start, :],
+                        k[:, :, demote_start:demote_end, :],
+                        k[:, :, remaining_history_start:N, :],
+                        k[:, :, new_frame_start:new_frame_end, :],
+                    ], dim=2)
+                    v_new = torch.cat([
+                        v[:, :, :new_frame_start, :],
+                        v[:, :, demote_start:demote_end, :],
+                        v[:, :, remaining_history_start:N, :],
+                        v[:, :, new_frame_start:new_frame_end, :],
+                    ], dim=2)
+                else:
+                    k_new = torch.cat([
+                        k[:, :, :new_frame_start, :],
+                        k[:, :, new_frame_end:N, :],
+                        k[:, :, new_frame_start:new_frame_end, :],
+                    ], dim=2)
+                    v_new = torch.cat([
+                        v[:, :, :new_frame_start, :],
+                        v[:, :, new_frame_end:N, :],
+                        v[:, :, new_frame_start:new_frame_end, :],
+                    ], dim=2)
+
+            past_key_values[idx] = (k_new, v_new)
+
+        return past_key_values
         
     def _calculate_dynamic_budgets(self, total_budget):
         # Handle None budget (eviction paused for History Anchor window)

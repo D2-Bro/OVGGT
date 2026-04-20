@@ -91,7 +91,10 @@ class Block(nn.Module):
         prev_importance=None,
         intra_frame_keep_ratio=1.0,
         anchor_token_count: int = None,
+        anchor_base_token_count: int = None,
+        history_anchor_layout: str = "front",
         importance_weight: float = 0.5,
+        cache_debug_current_frame_idx: int = None,
     ) -> Union[Tensor, Tuple[Tensor, Dict]]:
 
         # Determine if we use two-stage eviction (intra-frame + inter-frame)
@@ -107,7 +110,10 @@ class Block(nn.Module):
             importance_scores=None,
             defer_eviction=False,
             anchor_token_count_inner=None,
+            anchor_base_token_count_inner=None,
+            history_anchor_layout_inner="front",
             importance_weight_inner: float = 0.5,
+            cache_debug_current_frame_idx_inner=None,
         ) -> Union[Tensor, Tuple[Tensor, Dict]]:
             if use_cache:
                 output, new_kv, scores = self.attn(
@@ -119,7 +125,10 @@ class Block(nn.Module):
                     importance_scores=importance_scores,
                     defer_eviction=defer_eviction,
                     anchor_token_count=anchor_token_count_inner,
+                    anchor_base_token_count=anchor_base_token_count_inner,
+                    history_anchor_layout=history_anchor_layout_inner,
                     importance_weight=importance_weight_inner,
+                    cache_debug_current_frame_idx=cache_debug_current_frame_idx_inner,
                 )
                 return self.ls1(output), new_kv, scores
             else:
@@ -143,6 +152,9 @@ class Block(nn.Module):
                     importance_scores=prev_importance,
                     defer_eviction=True,
                     anchor_token_count_inner=anchor_token_count,
+                    anchor_base_token_count_inner=anchor_base_token_count,
+                    history_anchor_layout_inner=history_anchor_layout,
+                    cache_debug_current_frame_idx_inner=cache_debug_current_frame_idx,
                 )
                 k_full, v_full, k_current, v_current, past_kv = kv_info
                 kept_indices = None
@@ -186,6 +198,22 @@ class Block(nn.Module):
                 else:
                     k, v = k_current_pruned, v_current_pruned
 
+                effective_anchor_count = anchor_token_count if anchor_token_count is not None else self.attn.num_anchor_tokens
+                kept_indices = None
+                history_anchor_layout = self.attn._history_anchor_layout(history_anchor_layout)
+                if history_anchor_layout == "tail":
+                    _, history_anchor_tokens = self.attn._anchor_split_counts(
+                        effective_anchor_count,
+                        anchor_base_token_count,
+                        history_anchor_layout,
+                    )
+                    k, v, kept_indices = self.attn._move_current_before_tail_anchors(
+                        k,
+                        v,
+                        history_anchor_tokens,
+                        k_current_pruned.shape[2],
+                    )
+
                 # Stage 2: Inter-frame eviction if budget exceeded
                 if cache_budget is not None and k.shape[2] > cache_budget:
                     num_new_tokens_after_prune = k_current_pruned.shape[2]
@@ -194,14 +222,27 @@ class Block(nn.Module):
                     else:
                         importance_pruned = new_importance
                     
-                    effective_anchor_count = anchor_token_count if anchor_token_count is not None else self.attn.num_anchor_tokens
-                    k, v, scores, kept_indices = self.attn.eviction(
+                    k, v, scores, eviction_kept_indices = self.attn.evict_with_layout(
                         k, v, cache_budget, effective_anchor_count,
                         importance_scores=importance_pruned,
                         num_new_tokens=num_new_tokens_after_prune,
                         importance_weight=importance_weight,
+                        history_anchor_layout=history_anchor_layout,
+                        anchor_base_token_count=anchor_base_token_count,
                     )
+                    if kept_indices is not None and eviction_kept_indices is not None:
+                        kept_indices = torch.gather(kept_indices, 1, eviction_kept_indices)
+                    elif eviction_kept_indices is not None:
+                        kept_indices = eviction_kept_indices
 
+                self.attn._update_cache_tsne_debug(
+                    k,
+                    v,
+                    num_new_tokens=k_current_pruned.shape[2],
+                    current_frame_idx=cache_debug_current_frame_idx,
+                    kept_indices=kept_indices,
+                    current_token_indices=intra_kept_indices,
+                )
                 new_kv = (k, v)
             else:
                 # Legacy single-stage eviction
@@ -214,7 +255,10 @@ class Block(nn.Module):
                     importance_scores=prev_importance,
                     defer_eviction=False,
                     anchor_token_count_inner=anchor_token_count,
+                    anchor_base_token_count_inner=anchor_base_token_count,
+                    history_anchor_layout_inner=history_anchor_layout,
                     importance_weight_inner=importance_weight,
+                    cache_debug_current_frame_idx_inner=cache_debug_current_frame_idx,
                 )
                 k, v, kept_indices = new_kv_full
                 new_kv = (k, v)

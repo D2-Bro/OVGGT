@@ -14,4 +14,3 @@ accelerate launch --num_processes 2 --main_process_port 29602 ./eval/mv_recon/la
     --output_dir "$output_dir" \
     --model_name "$model_name" \
     --max_frames "$max_frames" \
-     
